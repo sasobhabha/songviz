@@ -1,0 +1,4 @@
+src/render
+*.o
+test/out*.mp4
+.DS_Store

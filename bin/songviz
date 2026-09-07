@@ -1,0 +1,170 @@
+#!/usr/bin/env bash
+# songviz — render a music visualizer video from any audio file.
+#
+# Usage:
+#   songviz [options] AUDIOFILE OUTPUT.mp4
+#
+# Examples:
+#   songviz song.mp3 song.mp4
+#   songviz --vertical --palette ocean "track.flac" "track.mp4"
+#   songviz --title "My Song" --subtitle "Artist" --bars 96 song.m4a out.mp4
+#
+# Requires: ffmpeg (and a macOS host for on-video title text).
+
+set -euo pipefail
+
+VERSION="1.0.0"
+
+# ---------------------------------------------------------------- defaults
+PRESET=""            # landscape | vertical | square
+WIDTH=1920 HEIGHT=1080
+FPS=30 BARS=64 PALETTE="neon" GAIN="1.0"
+TITLE="" SUBTITLE="" TITLE_SIZE="" SUBTITLE_SIZE=""
+FMIN="" FMAX="" SECONDS="" CRF="18"
+AUDIO_BR="192k" PRESET_X264="fast" OUT_FMT="yuv420p"
+
+usage() {
+  cat <<'SONGVIZ_HELP_EOF'
+songviz — turn any song into a bar-spectrum visualizer video (mp4)
+
+USAGE
+  songviz [options] AUDIOFILE OUTPUT.mp4
+
+PRESETS
+  --landscape           1920x1080 (default)
+  --vertical            1080x1920, for Shorts / Reels / TikTok
+  --square              1080x1080, for Instagram feed posts
+
+OPTIONS
+  -t, --title TEXT       title shown at the top (auto-shrinks to fit)
+  -s, --subtitle TEXT    subtitle line under the title
+  -p, --palette NAME     neon | sunset | ocean | mono | candy | matrix
+      --bars N           number of spectrum bars, 8-256 (default 64)
+      --fps N            output frame rate (default 30)
+      --gain X           bar sensitivity, 0.5 = calmer, 2 = jumpy (default 1)
+      --fmin HZ          lowest frequency shown (default 30)
+      --fmax HZ          highest frequency shown (default 14000)
+      --seconds S        only render the first S seconds
+      --width N          custom width (overrides preset)
+      --height N         custom height (overrides preset)
+      --title-size N     font size override for title
+      --subtitle-size N  font size override for subtitle
+      --crf N            x264 quality, lower = better (default 18)
+      --audio-bitrate R  audio bitrate (default 192k)
+      --x264-preset P    x264 speed preset (default fast)
+  -V, --version          print version
+  -h, --help             show this help
+
+EXAMPLES
+  songviz "Bohemian Rhapsody.mp3" video.mp4
+  songviz --vertical --palette ocean demo.m4a reel.mp4
+  songviz -t "Midnight City" -s "M83" --bars 96 --palette sunset m83.mp3 out.mp4
+  songviz --gain 1.8 --palette matrix --seconds 30 track.flac teaser.mp4
+
+TITLES: On macOS, -t/-s are rendered into the video with CoreText.
+On other platforms, titles are skipped — add them in your editor.
+Requires ffmpeg on PATH.
+SONGVIZ_HELP_EOF
+}
+
+die() { echo "songviz: $*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null 2>&1 || die "$1 is required but was not found on PATH"; }
+
+# ---------------------------------------------------------------- parse args
+POSITIONAL=()
+ALL_ARGS=("$@")   # keep a copy: $@ is consumed below
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --landscape) PRESET="landscape" ;;
+    --vertical)  PRESET="vertical"  ;;
+    --square)    PRESET="square"    ;;
+    -t|--title)          [[ $# -ge 2 ]] || die "$1 needs a value"; TITLE="$2"; shift ;;
+    -s|--subtitle)       [[ $# -ge 2 ]] || die "$1 needs a value"; SUBTITLE="$2"; shift ;;
+    -p|--palette)        [[ $# -ge 2 ]] || die "$1 needs a value"; PALETTE="$2"; shift ;;
+    --bars)              [[ $# -ge 2 ]] || die "$1 needs a value"; BARS="$2"; shift ;;
+    --fps)               [[ $# -ge 2 ]] || die "$1 needs a value"; FPS="$2"; shift ;;
+    --gain)              [[ $# -ge 2 ]] || die "$1 needs a value"; GAIN="$2"; shift ;;
+    --fmin)              [[ $# -ge 2 ]] || die "$1 needs a value"; FMIN="$2"; shift ;;
+    --fmax)              [[ $# -ge 2 ]] || die "$1 needs a value"; FMAX="$2"; shift ;;
+    --seconds)           [[ $# -ge 2 ]] || die "$1 needs a value"; SECONDS="$2"; shift ;;
+    --width)             [[ $# -ge 2 ]] || die "$1 needs a value"; WIDTH="$2"; shift ;;
+    --height)            [[ $# -ge 2 ]] || die "$1 needs a value"; HEIGHT="$2"; shift ;;
+    --title-size)        [[ $# -ge 2 ]] || die "$1 needs a value"; TITLE_SIZE="$2"; shift ;;
+    --subtitle-size)     [[ $# -ge 2 ]] || die "$1 needs a value"; SUBTITLE_SIZE="$2"; shift ;;
+    --crf)               [[ $# -ge 2 ]] || die "$1 needs a value"; CRF="$2"; shift ;;
+    --audio-bitrate)     [[ $# -ge 2 ]] || die "$1 needs a value"; AUDIO_BR="$2"; shift ;;
+    --x264-preset)       [[ $# -ge 2 ]] || die "$1 needs a value"; PRESET_X264="$2"; shift ;;
+    -V|--version) echo "songviz $VERSION"; exit 0 ;;
+    -h|--help)    usage; exit 0 ;;
+    --) shift; while [[ $# -gt 0 ]]; do POSITIONAL+=("$1"); shift; done ;;
+    -*) die "unknown option '$1' (see --help)" ;;
+    *)  POSITIONAL+=("$1") ;;
+  esac
+  shift
+done
+
+[[ ${#POSITIONAL[@]} -ge 2 ]] || { usage >&2; die "need an AUDIOFILE and an OUTPUT.mp4"; }
+INPUT="${POSITIONAL[0]}"
+OUTPUT="${POSITIONAL[1]}"
+[[ -f "$INPUT" ]] || die "input file not found: $INPUT"
+
+# ---------------------------------------------------------------- deps
+need ffmpeg
+RENDER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../src"
+RENDER=""
+for c in "$RENDER_DIR/render" "songviz-render" "$(dirname "$0")/../src/render"; do
+  if [[ -x "$c" ]] || command -v "$c" >/dev/null 2>&1; then RENDER="$c"; break; fi
+done
+[[ -n "$RENDER" ]] || die "songviz-render binary not found — run 'make' first"
+
+# ---------------------------------------------------------------- presets
+# Presets only apply to dimensions the user did not set explicitly.
+user_set() { local f="$1"; for a in "${ALL_ARGS[@]}"; do [[ "$a" == "$f" ]] && return 0; done; return 1; }
+
+if   [[ "$PRESET" == "vertical" ]]; then
+  user_set --width  || WIDTH=1080
+  user_set --height || HEIGHT=1920
+elif [[ "$PRESET" == "square" ]]; then
+  user_set --width  || WIDTH=1080
+  user_set --height || HEIGHT=1080
+else
+  user_set --width  || WIDTH=1920
+  user_set --height || HEIGHT=1080
+fi
+
+# ---------------------------------------------------------------- renderer args
+ARGS=( --width "$WIDTH" --height "$HEIGHT" --fps "$FPS" --bars "$BARS"
+       --palette "$PALETTE" --gain "$GAIN" )
+[[ -n "$TITLE" ]]        && ARGS+=( --title "$TITLE" )
+[[ -n "$SUBTITLE" ]]     && ARGS+=( --subtitle "$SUBTITLE" )
+[[ -n "$TITLE_SIZE" ]]   && ARGS+=( --title-size "$TITLE_SIZE" )
+[[ -n "$SUBTITLE_SIZE" ]]&& ARGS+=( --subtitle-size "$SUBTITLE_SIZE" )
+[[ -n "$FMIN" ]]         && ARGS+=( --fmin "$FMIN" )
+[[ -n "$FMAX" ]]         && ARGS+=( --fmax "$FMAX" )
+[[ -n "$SECONDS" ]]      && ARGS+=( --seconds "$SECONDS" )
+
+# ---------------------------------------------------------------- run
+TMP_DIR="$(mktemp -d)"
+TMP_PCM="$TMP_DIR/audio.pcm"
+trap 'rm -rf "$TMP_DIR"' EXIT
+
+echo "songviz: decoding $INPUT" >&2
+ffmpeg -y -v error -i "$INPUT" -map a:0 -f f32le -ac 1 -ar 44100 "$TMP_PCM"
+
+echo "songviz: rendering ${WIDTH}x${HEIGHT} @ ${FPS}fps, ${BARS} bars, palette ${PALETTE}" >&2
+echo "songviz: encoding with libx264 (crf $CRF, preset $PRESET_X264)" >&2
+
+# Render + encode: renderer streams RGB frames into ffmpeg, which muxes
+# the original audio back in. Single pass, no temp video file.
+set -o pipefail
+"$RENDER" "${ARGS[@]}" "$TMP_PCM" \
+| ffmpeg -y -v warning -stats \
+    -f rawvideo -pix_fmt rgb24 -s "${WIDTH}x${HEIGHT}" -r "$FPS" -i - \
+    -i "$INPUT" \
+    -map 0:v -map 1:a:0 \
+    -c:v libx264 -preset "$PRESET_X264" -crf "$CRF" -pix_fmt "$OUT_FMT" \
+    -c:a aac -b:a "$AUDIO_BR" \
+    -shortest -movflags +faststart \
+    "$OUTPUT"
+
+echo "songviz: wrote $OUTPUT" >&2
